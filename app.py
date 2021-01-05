@@ -1,25 +1,28 @@
 import os
+import joblib
 import json
 import pickle
-import joblib
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from peewee import (
-    Model, IntegerField, FloatField,
-    TextField, IntegrityError
+    SqliteDatabase, PostgresqlDatabase, Model, IntegerField,
+    FloatField, TextField, IntegrityError
 )
 from playhouse.shortcuts import model_to_dict
-from playhouse.db_url import connect
 
 
-########################################
-# Begin database stuff
+# Unpickle the previously-trained sklearn model
+with open('columns.json') as fh:
+    columns = json.load(fh)
 
-# the connect function checks if there is a DATABASE_URL env var
-# if it exists, it uses it to connect to a remote postgres db
-# otherwise, it connects to a local sqlite db stored in predictions.db
-DB = connect(os.environ.get('DATABASE_URL') or 'sqlite:///predictions.db')
+with open('dtypes.pickle', 'rb') as fh:
+    dtypes = pickle.load(fh)
 
+pipeline = joblib.load('pipeline.pickle')
+
+
+# set up database
+DB = SqliteDatabase('predictions.db')
 class Prediction(Model):
     observation_id = IntegerField(unique=True)
     observation = TextField()
@@ -29,47 +32,39 @@ class Prediction(Model):
     class Meta:
         database = DB
 
-
 DB.create_tables([Prediction], safe=True)
 
-# End database stuff
-########################################
 
-########################################
-# Unpickle the previously-trained model
-
-
-with open('columns.json') as fh:
-    columns = json.load(fh)
-
-pipeline = joblib.load('pipeline.pickle')
-
-with open('dtypes.pickle', 'rb') as fh:
-    dtypes = pickle.load(fh)
-
-
-# End model un-pickling
-########################################
-
-
-########################################
-# Begin webserver stuff
-
+# Create Flask webserver
 app = Flask(__name__)
 
 
+def predict():
+    payload = request.get_json()
+    obs = pd.DataFrame([payload], columns=columns).astype(dtypes)
+    proba = pipeline.predict_proba(obs)[0, 1]
+    return jsonify({
+        'prediction': proba
+    })
+
 @app.route('/predict', methods=['POST'])
 def predict():
-    # flask provides a deserialization convenience function called
-    # get_json that will work if the mimetype is application/json
-    obs_dict = request.get_json()
-    _id = obs_dict['id']
-    observation = obs_dict['observation']
-    # now do what we already learned in the notebooks about how to transform
-    # a single observation into a dataframe that will work with a pipeline
-    obs = pd.DataFrame([observation], columns=columns).astype(dtypes)
-    # now get ourselves an actual prediction of the positive class
-    proba = pipeline.predict_proba(obs)[0, 1]
+    # deserialise data
+    raw = request.get_json()
+    _id = raw['id']
+    data = raw['observation']
+
+    # create dataframe
+    try:
+        X = pd.DataFrame([data], columns=columns).astype(dtypes)
+    except ValueError:
+        error_msg = 'Observation is invalid!'
+        response = {'error': error_msg}
+        print(error_msg)
+        return jsonify(response)
+
+    # predict
+    proba = pipeline.predict_proba(X)[0, 1]
     response = {'proba': proba}
     p = Prediction(
         observation_id=_id,
@@ -105,9 +100,6 @@ def list_db_contents():
         model_to_dict(obs) for obs in Prediction.select()
     ])
 
-
-# End webserver stuff
-########################################
-
+# run
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
